@@ -1,21 +1,136 @@
 import json
+
 from ai.prompts import (
     SQL_PROMPT,
     SQL_RESULT_PROMPT
 )
+
 from ai.sql_validator import validate_sql
 from ai.sql_executor import execute_sql
 from services.groq import chat_completion
 from utils.sql import supabase
 
 
-def run_sql(question: str, history: str = ""):
-    # -----------------------------
-    # Step 1: Generate SQL
-    # -----------------------------
-    sql_response = chat_completion(
+MAX_SQL_ATTEMPTS = 2
+MAX_ROWS_FOR_LLM = 30
+
+
+def clean_sql(sql: str) -> str:
+    """
+    Clean common formatting returned by the LLM.
+    """
+
+    if not sql:
+        return ""
+
+    sql = sql.strip()
+
+    sql = sql.replace("```sql", "")
+    sql = sql.replace("```SQL", "")
+    sql = sql.replace("```", "")
+
+    sql = sql.strip()
+
+    if sql.endswith(";"):
+        sql = sql[:-1]
+
+    return sql.strip()
+
+
+def validate_generated_sql(sql: str):
+    """
+    Perform application-level validation on generated SQL.
+
+    Returns:
+        (True, None) if valid
+        (False, error_message) if invalid
+    """
+
+    if not validate_sql(sql):
+        return (
+            False,
+            "SQL failed the safety validation. "
+            "Only safe SELECT queries are allowed."
+        )
+
+    upper_sql = sql.upper().strip()
+
+    # --------------------------------------------------
+    # Incomplete FROM clause
+    # --------------------------------------------------
+
+    if upper_sql.endswith("FROM"):
+        return (
+            False,
+            "SQL is incomplete. The FROM clause is missing "
+            "a table."
+        )
+
+    # --------------------------------------------------
+    # Alias validation
+    # --------------------------------------------------
+
+    if (
+        "TM." in upper_sql
+        and "JOIN TEAM_MEMBERS TM" not in upper_sql
+    ):
+        return (
+            False,
+            "The query uses the tm alias but does not "
+            "join team_members as tm."
+        )
+
+    if (
+        "P." in upper_sql
+        and "JOIN PROJECTS P" not in upper_sql
+    ):
+        return (
+            False,
+            "The query uses the p alias but does not "
+            "join projects as p."
+        )
+
+    if (
+        "DU." in upper_sql
+        and "FROM DAILY_UPDATES DU" not in upper_sql
+    ):
+        return (
+            False,
+            "The query uses the du alias but does not "
+            "define daily_updates as du."
+        )
+
+    # --------------------------------------------------
+    # Basic JOIN validation
+    # --------------------------------------------------
+
+    if "JOIN TEAM_MEMBERS TM" in upper_sql:
+        if "ON DU.MEMBER_ID = TM.ID" not in upper_sql:
+            return (
+                False,
+                "The team_members join is missing the required "
+                "ON condition."
+            )
+
+    if "JOIN PROJECTS P" in upper_sql:
+        if "ON DU.PROJECT_ID = P.ID" not in upper_sql:
+            return (
+                False,
+                "The projects join is missing the required "
+                "ON condition."
+            )
+
+    return True, None
+
+
+def generate_sql(question: str, history: str = ""):
+    """
+    Generate SQL using the LLM.
+    """
+
+    response = chat_completion(
         temperature=0,
-        max_tokens=300,
+        max_tokens=1000,
         messages=[
             {
                 "role": "system",
@@ -35,108 +150,241 @@ Current Question:
             }
         ]
     )
-    generated_sql = (
-        sql_response
+
+    sql = (
+        response
         .choices[0]
         .message
         .content
         .strip()
     )
-    generated_sql = generated_sql.replace("```sql", "")
-    generated_sql = generated_sql.replace("```", "")
-    generated_sql = generated_sql.strip()
 
-    if generated_sql.endswith(";"):
-        generated_sql = generated_sql[:-1]
+    return clean_sql(sql)
 
-    # -----------------------------
-    # Step 2: Validate SQL
-    # -----------------------------
-    if not validate_sql(generated_sql):
 
-        print("\n========== INVALID GENERATED SQL ==========")
-        print(generated_sql)
-        print("===========================================\n")
+def repair_sql(
+    question: str,
+    generated_sql: str,
+    error_message: str,
+    history: str = ""
+):
+    """
+    Ask the LLM to correct an invalid SQL query.
+    """
 
-        raise Exception(
-            f"Unsafe SQL generated.\n\nGenerated SQL:\n{generated_sql}"
+    repair_prompt = f"""
+You are repairing a PostgreSQL query generated for
+an internal Team Management Dashboard.
+
+The previous SQL query was invalid.
+
+USER QUESTION:
+{question}
+
+PREVIOUS CONVERSATION:
+{history}
+
+PREVIOUS SQL:
+{generated_sql}
+
+VALIDATION / DATABASE ERROR:
+{error_message}
+
+Your task is to generate a corrected SQL query.
+
+IMPORTANT RULES:
+
+1. Return ONLY the corrected SQL query.
+2. Return exactly ONE SELECT query.
+3. Do not explain anything.
+4. Do not use markdown.
+5. Do not use ```sql.
+6. Do not use INSERT, UPDATE, DELETE, DROP, ALTER,
+   CREATE, TRUNCATE, GRANT, or REVOKE.
+7. Use only tables and columns defined in the original
+   SQL schema.
+8. Make sure every table alias used in SELECT, WHERE,
+   ORDER BY, GROUP BY, or JOIN actually exists.
+9. Every JOIN must contain a valid ON condition.
+10. Make sure the query is complete and executable.
+11. Use the minimum number of tables required.
+12. Preserve the user's original intent.
+
+Return ONLY the corrected SQL query.
+"""
+
+    response = chat_completion(
+        temperature=0,
+        max_tokens=1000,
+        messages=[
+            {
+                "role": "system",
+                "content": SQL_PROMPT
+            },
+            {
+                "role": "user",
+                "content": repair_prompt
+            }
+        ]
+    )
+
+    repaired_sql = (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+
+    return clean_sql(repaired_sql)
+
+
+def run_sql(question: str, history: str = ""):
+
+    # ==================================================
+    # Step 1: Generate + Validate SQL
+    # ==================================================
+
+    generated_sql = ""
+    last_error = ""
+
+    for attempt in range(1, MAX_SQL_ATTEMPTS + 1):
+
+        print(
+            f"\n========== SQL ATTEMPT {attempt} =========="
         )
 
-    # --------------------------------------------------
-    # Basic SQL completeness check
-    # --------------------------------------------------
-    upper_sql = generated_sql.upper().strip()
+        try:
 
-    if upper_sql.endswith("FROM"):
+            if attempt == 1:
 
-        print("\n========== INCOMPLETE GENERATED SQL ==========")
-        print(generated_sql)
-        print("===============================================\n")
+                generated_sql = generate_sql(
+                    question,
+                    history
+                )
 
-        raise Exception(
-            f"Incomplete SQL generated.\n\nGenerated SQL:\n{generated_sql}"
-        )
+            else:
 
-    # --------------------------------------------------
-    # Alias / JOIN validation
-    # --------------------------------------------------
+                generated_sql = repair_sql(
+                    question,
+                    generated_sql,
+                    last_error,
+                    history
+                )
 
-    if "TM." in upper_sql and "JOIN TEAM_MEMBERS TM" not in upper_sql:
+            print("\nGenerated SQL:")
+            print(generated_sql)
 
-        raise Exception(
-            "Invalid SQL: tm alias used without team_members join.\n\n"
-            f"Generated SQL:\n{generated_sql}"
-        )
+            # ------------------------------------------
+            # Validate SQL
+            # ------------------------------------------
 
+            is_valid, validation_error = (
+                validate_generated_sql(
+                    generated_sql
+                )
+            )
 
-    if "P." in upper_sql and "JOIN PROJECTS P" not in upper_sql:
+            if not is_valid:
 
-        raise Exception(
-            "Invalid SQL: p alias used without projects join.\n\n"
-            f"Generated SQL:\n{generated_sql}"
-        )
+                last_error = validation_error
 
+                print(
+                    "\nSQL VALIDATION FAILED:"
+                )
+                print(last_error)
 
-    if "DU." in upper_sql and "FROM DAILY_UPDATES DU" not in upper_sql:
+                if attempt < MAX_SQL_ATTEMPTS:
+                    print(
+                        "\nAttempting SQL correction..."
+                    )
+                    continue
 
-        raise Exception(
-            "Invalid SQL: du alias used without daily_updates alias.\n\n"
-            f"Generated SQL:\n{generated_sql}"
-        )
+                raise Exception(
+                    f"SQL validation failed after "
+                    f"{MAX_SQL_ATTEMPTS} attempts.\n\n"
+                    f"Last error:\n{last_error}\n\n"
+                    f"Generated SQL:\n{generated_sql}"
+                )
 
+            # ------------------------------------------
+            # Execute SQL
+            # ------------------------------------------
 
-    # -----------------------------
-    # Step 3: Execute SQL
-    # -----------------------------
+            try:
 
-    try:
+                rows = execute_sql(
+                    generated_sql
+                )
 
-        rows = execute_sql(generated_sql)
+                print(
+                    "\nSQL EXECUTION SUCCESSFUL"
+                )
 
-        MAX_ROWS_FOR_LLM = 30
+                print(
+                    "\n========== SQL ROWS =========="
+                )
+                print(rows)
+                print(
+                    "==================================\n"
+                )
 
-        if len(rows) > MAX_ROWS_FOR_LLM:
-            rows_for_llm = rows[:MAX_ROWS_FOR_LLM]
-        else:
-            rows_for_llm = rows
+                # --------------------------------------
+                # Successful SQL
+                # --------------------------------------
 
-        print("\n========== GENERATED SQL ==========")
-        print(generated_sql)
+                break
 
-        print("\n========== SQL ROWS ==========")
-        print(rows)
+            except Exception as db_error:
 
-        print("==================================\n")
+                last_error = (
+                    f"Database execution failed: "
+                    f"{db_error}"
+                )
 
-    except Exception as e:
+                print(
+                    "\nSQL EXECUTION FAILED:"
+                )
+                print(last_error)
 
-        raise Exception(
-            f"SQL Execution Error:\n{e}\n\nGenerated SQL:\n{generated_sql}"
-        )
+                if attempt < MAX_SQL_ATTEMPTS:
 
-    # -----------------------------
-    # Step 4: Explain Results
-    # -----------------------------
+                    print(
+                        "\nAttempting SQL correction..."
+                    )
+
+                    continue
+
+                raise Exception(
+                    f"SQL Execution Error after "
+                    f"{MAX_SQL_ATTEMPTS} attempts:\n"
+                    f"{last_error}\n\n"
+                    f"Generated SQL:\n"
+                    f"{generated_sql}"
+                )
+
+        except Exception:
+
+            if attempt >= MAX_SQL_ATTEMPTS:
+                raise
+
+    # ==================================================
+    # Step 2: Limit rows sent to LLM
+    # ==================================================
+
+    if len(rows) > MAX_ROWS_FOR_LLM:
+
+        rows_for_llm = rows[
+            :MAX_ROWS_FOR_LLM
+        ]
+
+    else:
+
+        rows_for_llm = rows
+
+    # ==================================================
+    # Step 3: Explain Results
+    # ==================================================
 
     result_context = json.dumps(
         rows_for_llm,
@@ -179,9 +427,9 @@ SQL Result:
         .strip()
     )
 
-    # -----------------------------
-    # Step 5: Save History
-    # -----------------------------
+    # ==================================================
+    # Step 4: Save History
+    # ==================================================
 
     try:
 
@@ -197,7 +445,14 @@ SQL Result:
 
     except Exception as e:
 
-        print(e)
+        print(
+            "Warning: Failed to save chat history:",
+            e
+        )
+
+    # ==================================================
+    # Step 5: Return
+    # ==================================================
 
     return {
         "response": answer,

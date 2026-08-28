@@ -5,7 +5,7 @@ def classify(question, history=""):
     response = chat_completion(
         model=FAST_MODEL,
         temperature=0,
-        max_tokens=50,
+        max_tokens=200,
         messages=[
             {
                 "role": "system",
