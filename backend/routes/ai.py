@@ -1,294 +1,289 @@
 import os
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from groq import Groq
+
 from utils.sql import supabase
+
 from ai.classifier import classify
 from ai.sql_pipeline import run_sql
+from ai.rag_pipeline import run_rag
 from ai.hybrid_pipeline import run_hybrid
 
+from services.groq import chat_completion
 
 router = APIRouter(
     prefix="/ai",
     tags=["AI Assistant"]
 )
 
+# ============================================================
+# GROQ CLIENT
+# ============================================================
 api_key = os.getenv("GROQ_API_KEY")
 
-client = Groq(api_key=api_key) if api_key else None
+client = (
+    Groq(api_key=api_key)
+    if api_key
+    else None
+)
 
-
+# ============================================================
+# REQUEST SCHEMA
+# ============================================================
 class ChatRequest(BaseModel):
     message: str
 
+# ============================================================
+# CHAT HISTORY HELPER
+# ============================================================
+def get_recent_history():
 
+    history_text = ""
+
+    try:
+        response = (
+            supabase
+            .table("ai_chat_history")
+            .select("question, ai_response")
+            .order(
+                "created_at",
+                desc=True
+            )
+            .limit(5)
+            .execute()
+        )
+
+        history_data = response.data or []
+
+        for chat in reversed(history_data):
+
+            history_text += (
+                f"User: {chat.get('question', '')}\n"
+                f"Assistant: {chat.get('ai_response', '')}\n\n"
+            )
+
+    except Exception as e:
+        print(
+            "History error:",
+            e
+        )
+    return history_text
+
+# ============================================================
+# SAVE CHAT HISTORY
+# ============================================================
+def save_chat_history(
+    question,
+    response,
+    generated_sql=None
+):
+    try:
+        supabase.table(
+            "ai_chat_history"
+        ).insert(
+            {
+                "question": question,
+                "generated_sql": generated_sql,
+                "ai_response": response
+            }
+        ).execute()
+
+    except Exception as e:
+        print(
+            "Chat history error:",
+            e
+        )
+
+# ============================================================
+# CHAT PIPELINE
+# ============================================================
+def run_chat(
+    question,
+    history=""
+):
+    response = chat_completion(
+        temperature=0.3,
+        max_tokens=300,
+        messages=[
+            {
+                "role": "system",
+                "content": """
+You are a friendly AI assistant for an internal
+Team Management Dashboard.
+
+Answer casual and conversational questions naturally.
+
+You can respond to greetings, small talk, thanks,
+and general conversational questions.
+
+Do not invent team, project, update, or database information.
+
+If the user asks for dashboard data, that question
+should normally be handled by the SQL, RAG, or HYBRID
+pipelines.
+"""
+            },
+            {
+                "role": "user",
+                "content": f"""
+Previous Conversation:
+
+{history}
+
+Current Question:
+
+{question}
+"""
+            }
+        ]
+    )
+    answer = (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+    save_chat_history(
+        question=question,
+        response=answer,
+        generated_sql=None
+    )
+    return {
+        "response": answer,
+        "generated_sql": None,
+        "rows": []
+    }
+
+# ============================================================
+# AI CHAT ENDPOINT
+# ============================================================
 @router.post("/chat")
-async def chat_with_assistant(payload: ChatRequest):
+async def chat_with_assistant(
+    payload: ChatRequest
+):
 
+    # --------------------------------------------------------
+    # Check Groq API key
+    # --------------------------------------------------------
     if client is None:
         raise HTTPException(
             status_code=500,
-            detail="GROQ_API_KEY is not configured in backend/.env"
+            detail="GROQ_API_KEY is not configured."
         )
-
     try:
-        history_text = ""
 
-        try:
-            history = (
-                supabase.table("ai_chat_history")
-                .select("question, ai_response")
-                .order("created_at", desc=True)
-                .limit(5)
-                .execute()
+        # ----------------------------------------------------
+        # Step 1: Get conversation history
+        # ----------------------------------------------------
+        history_text = get_recent_history()
+
+        # ----------------------------------------------------
+        # Step 2: Classify question
+        # ----------------------------------------------------
+        route = classify(
+            payload.message,
+            history_text
+        )
+        print(
+            "=================================="
+        )
+        print(
+            f"Question: {payload.message}"
+        )
+        print(
+            f"Route: {route}"
+        )
+        print(
+            "=================================="
+        )
+
+        # ====================================================
+        # CHAT
+        # ====================================================
+        if route == "CHAT":
+            return run_chat(
+                payload.message,
+                history_text
             )
 
-            for chat in reversed(history.data):
-                history_text += (
-                    f"User: {chat['question']}\n"
-                    f"Assistant: {chat['ai_response']}\n\n"
-                )
+        # ====================================================
+        # SQL
+        # ====================================================
+        elif route == "SQL":
+            return run_sql(
+                payload.message,
+                history_text
+            )
 
-        except Exception as e:
-            print("History error:", e)
+        # ====================================================
+        # RAG
+        # ====================================================
+        elif route == "RAG":
+            return run_rag(
+                payload.message,
+                history_text
+            )
 
-        # Decide which pipeline to use
-        route = classify(payload.message, history_text)
-
-        print(f"Route: {route}")
-
-        if route == "SQL":
-            return run_sql(payload.message, history_text)
+        # ====================================================
+        # HYBRID
+        # ====================================================
         elif route == "HYBRID":
-            return run_hybrid(payload.message)
-
-        # If RAG, continue with the existing code below
-
-        # ============================
-        # Fetch data from Supabase
-        # ============================
-
-        members_resp = supabase.table("team_members").select("*").execute()
-        projects_resp = supabase.table("projects").select("*").execute()
-        updates_resp = supabase.table("daily_updates").select("*").execute()
-
-        team_members = members_resp.data or []
-        projects = projects_resp.data or []
-        updates = updates_resp.data or []
-
-        # ...rest of your existing RAG code...
-        # ============================
-        # Create lookup dictionaries
-        # ============================
-
-        member_lookup = {
-            member["id"]: member["full_name"]
-            for member in team_members
-        }
-
-        project_lookup = {
-            project["id"]: project["project_name"]
-            for project in projects
-        }
-
-        # ============================
-        # Format Team Members
-        # ============================
-
-        member_context = "\n".join(
-            [
-                f"""
-Name: {m['full_name']}
-Role: {m['role']}
-Department: {m['department']}
-Email: {m['email']}
-"""
-                for m in team_members
-            ]
-        )
-
-        # ============================
-        # Format Projects
-        # ============================
-
-        project_context = "\n".join(
-            [
-                f"""
-Project: {p['project_name']}
-Status: {p['status']}
-Description: {p['description']}
-"""
-                for p in projects
-            ]
-        )
-
-        # ============================
-        # Format Daily Updates
-        # ============================
-
-        formatted_updates = []
-
-        for update in updates:
-
-            member_name = member_lookup.get(
-                update["member_id"],
-                "Unknown Member"
+            return run_hybrid(
+                payload.message,
+                history_text
             )
 
-            project_name = project_lookup.get(
-                update["project_id"],
-                "Unknown Project"
+        # ====================================================
+        # UNKNOWN ROUTE
+        # ====================================================
+        else:
+            print(
+                f"Unknown route received: {route}"
+            )
+            # Safe fallback to SQL for dashboard questions
+            return run_sql(
+                payload.message,
+                history_text
             )
 
-            blockers = update.get("blockers")
-
-            if (
-                blockers is None
-                or str(blockers).strip().lower()
-                in ["", "no", "none", "nil"]
-            ):
-                blockers = "No blockers reported"
-
-            formatted_updates.append(
-                f"""
-Team Member : {member_name}
-
-Project : {project_name}
-
-Date : {update['update_date']}
-
-Task Completed :
-{update['task_completed']}
-
-Hours Worked :
-{update['hours_worked']}
-
-Current Status :
-{update['status']}
-
-Blockers :
-{blockers}
-"""
-            )
-
-        updates_context = "\n----------------------------------------\n".join(
-            formatted_updates
-        )
-
-        # ============================
-        # Build AI Context
-        # ============================
-
-        db_context = f"""
-================ TEAM MEMBERS ================
-
-{member_context}
-
-================ PROJECTS ====================
-
-{project_context}
-
-================ DAILY UPDATES ===============
-
-{updates_context}
-"""
-
-        # ============================
-        # System Prompt
-        # ============================
-
-        system_prompt = f"""
-You are an AI Assistant for an internal Team Management Dashboard.
-
-You MUST answer ONLY using the supplied database context.
-
-Guidelines:
-
-- Never mention member IDs or project IDs unless explicitly asked.
-- Always refer to people by their names.
-- Always refer to projects by their names.
-- Present responses professionally.
-- Use bullet points or headings whenever appropriate.
-- Summarize instead of copying raw data.
-- If blockers are "No", "None", or empty, say "No blockers reported."
-- Never expose Python dictionaries or JSON.
-- Never make up information.
-- If the requested information does not exist, politely say so.
-
-Database Context:
-
-{db_context}
-"""
-
-        # ============================
-        # Ask Groq
-        # ============================
-
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": payload.message
-                }
-            ],
-            temperature=0.2,
-            max_tokens=1024,
-        )
-
-        reply = completion.choices[0].message.content
-
-        # ============================
-        # Save Chat History
-        # ============================
-
-        try:
-
-            supabase.table("ai_chat_history").insert(
-                {
-                    "question": payload.message,
-                    "generated_sql": None,
-                    "ai_response": reply,
-                }
-            ).execute()
-
-        except Exception as db_err:
-            print(f"Warning: Failed to save history: {db_err}")
-
-        return {
-            "response": reply
-        }
-
+    # --------------------------------------------------------
+    # Error handling
+    # --------------------------------------------------------
     except Exception as e:
-        print(f"Error in /ai/chat: {e}")
+        print(
+            f"Error in /ai/chat: {e}"
+        )
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
 
-
+# ============================================================
+# GET CHAT HISTORY
+# ============================================================
 @router.get("/history")
 async def get_chat_history():
-
     try:
-
         response = (
-            supabase.table("ai_chat_history")
+            supabase
+            .table("ai_chat_history")
             .select("*")
-            .order("created_at", desc=False)
+            .order(
+                "created_at",
+                desc=False
+            )
             .execute()
         )
-
         return {
             "history": response.data or []
         }
-
     except Exception as e:
-
+        print(
+            f"Error fetching chat history: {e}"
+        )
         raise HTTPException(
             status_code=500,
             detail=str(e)

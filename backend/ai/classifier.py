@@ -1,26 +1,11 @@
-import os
-
-from groq import Groq
-
 from ai.prompts import ROUTER_PROMPT
-
-client = Groq(
-    api_key=os.getenv("GROQ_API_KEY")
-)
-
+from services.groq import chat_completion, FAST_MODEL
 
 def classify(question, history=""):
-    """
-    Classifies a user question into one of:
-        - RAG
-        - SQL
-        - HYBRID
-    """
-
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+    response = chat_completion(
+        model=FAST_MODEL,
         temperature=0,
-        max_tokens=5,
+        max_tokens=50,
         messages=[
             {
                 "role": "system",
@@ -29,28 +14,28 @@ def classify(question, history=""):
             {
                 "role": "user",
                 "content": f"""
-                Previous Conversation:
-
-                {history}
-
-                Current Question:
-
-                {question}
-                """
+Previous Conversation:
+{history}
+Current Question:
+{question}
+"""
             }
         ],
     )
-
     route = (
         response.choices[0]
-        .message.content
+        .message
+        .content
         .strip()
         .upper()
     )
-
     print("Classifier raw output:", repr(route))
-
-    if route not in ["RAG", "SQL", "HYBRID"]:
+    if "HYBRID" in route:
+        return "HYBRID"
+    if "SQL" in route:
+        return "SQL"
+    if "RAG" in route:
         return "RAG"
-
-    return route
+    if "CHAT" in route:
+        return "CHAT"
+    return "SQL"

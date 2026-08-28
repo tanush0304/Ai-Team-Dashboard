@@ -8,7 +8,6 @@ router = APIRouter(
     tags=["Projects"]
 )
 
-
 @router.get("/")
 def get_projects():
 
@@ -19,7 +18,6 @@ def get_projects():
         .order("id")
         .execute()
     )
-
     return response.data
 
 
@@ -42,25 +40,20 @@ def get_project(project_id: int):
 
     return response.data[0]
 
-
 @router.post("/")
 def create_project(project: ProjectCreate):
-
     response = (
         supabase
         .table("projects")
         .insert(project.model_dump())
         .execute()
     )
-
     return response.data
 
 
 @router.put("/{project_id}")
 def update_project(project_id: int, project: ProjectUpdate):
-
     update_data = project.model_dump(exclude_none=True)
-
     response = (
         supabase
         .table("projects")
@@ -71,10 +64,8 @@ def update_project(project_id: int, project: ProjectUpdate):
 
     return response.data
 
-
 @router.delete("/{project_id}")
 def delete_project(project_id: int):
-
     response = (
         supabase
         .table("projects")
@@ -82,7 +73,6 @@ def delete_project(project_id: int):
         .eq("id", project_id)
         .execute()
     )
-
     return {
         "message": "Project deleted successfully",
         "data": response.data
